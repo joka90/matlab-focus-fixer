@@ -9,12 +9,60 @@
 #include <stdio.h>
 #include <string.h>
 
+
+#include <stdlib.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <string.h>
+#include <locale.h>
+#include <glib.h>
+
 static Time last_access;
 static Window last_focus;
 
 void GetCurrWindow(Display * d, Window * win);
 void TimeFromXEvent(XEvent xev, Time * t);
 
+// Start from wmctrl
+static gchar *get_property (Display *disp, Window win, 
+        Atom xa_prop_type, gchar *prop_name, unsigned long *size);
+static Window get_active_window(Display *dpy);
+static int window_state (Display *disp, Window win, char *arg);
+static int client_msg(Display *disp, Window win, char *msg, 
+        unsigned long data0, unsigned long data1, 
+        unsigned long data2, unsigned long data3,
+        unsigned long data4);
+
+#define p_verbose(...) if (options.verbose) { \
+    fprintf(stderr, __VA_ARGS__); \
+}
+
+
+#define MAX_PROPERTY_VALUE_LEN 4096
+#define SELECT_WINDOW_MAGIC ":SELECT:"
+#define ACTIVE_WINDOW_MAGIC ":ACTIVE:"
+
+#define _NET_WM_STATE_REMOVE        0    /* remove/unset property */
+#define _NET_WM_STATE_ADD           1    /* add/set property */
+#define _NET_WM_STATE_TOGGLE        2    /* toggle property  */
+
+//TODO hard coded options
+static struct {
+    int verbose;
+    int force_utf8;
+    int show_class;
+    int show_pid;
+    int show_geometry;
+    int match_by_id;
+	int match_by_cls;
+    int full_window_title_match;
+    int wa_desktop_titles_invalid_utf8;
+    char *param_window;
+    char *param;
+} options;
+
+
+// END from wmctrl
 
 int
 XNextEvent(Display * display, XEvent * event)
@@ -256,4 +304,166 @@ TimeFromXEvent(XEvent xev, Time * t)
   }
 }
 
+
+//Snippet from wmctrl
+static gchar *get_property (Display *disp, Window win, /*{{{*/
+        Atom xa_prop_type, gchar *prop_name, unsigned long *size) {
+    Atom xa_prop_name;
+    Atom xa_ret_type;
+    int ret_format;
+    unsigned long ret_nitems;
+    unsigned long ret_bytes_after;
+    unsigned long tmp_size;
+    unsigned char *ret_prop;
+    gchar *ret;
+    
+    xa_prop_name = XInternAtom(disp, prop_name, False);
+    
+    /* MAX_PROPERTY_VALUE_LEN / 4 explanation (XGetWindowProperty manpage):
+     *
+     * long_length = Specifies the length in 32-bit multiples of the
+     *               data to be retrieved.
+     */
+    if (XGetWindowProperty(disp, win, xa_prop_name, 0, MAX_PROPERTY_VALUE_LEN / 4, False,
+            xa_prop_type, &xa_ret_type, &ret_format,     
+            &ret_nitems, &ret_bytes_after, &ret_prop) != Success) {
+        p_verbose("Cannot get %s property.\n", prop_name);
+        return NULL;
+    }
+  
+    if (xa_ret_type != xa_prop_type) {
+        p_verbose("Invalid type of %s property.\n", prop_name);
+        XFree(ret_prop);
+        return NULL;
+    }
+
+    /* null terminate the result to make string handling easier */
+    tmp_size = (ret_format / (32 / sizeof(long))) * ret_nitems;
+    ret = g_malloc(tmp_size + 1);
+    memcpy(ret, ret_prop, tmp_size);
+    ret[tmp_size] = '\0';
+
+    if (size) {
+        *size = tmp_size;
+    }
+    
+    XFree(ret_prop);
+    return ret;
+}/*}}}*/
+
+//Snippet from wmctrl
+static Window get_active_window(Display *disp) {/*{{{*/
+    char *prop;
+    unsigned long size;
+    Window ret = (Window)0;
+    
+    prop = get_property(disp, DefaultRootWindow(disp), XA_WINDOW, 
+                        "_NET_ACTIVE_WINDOW", &size);
+    if (prop) {
+        ret = *((Window*)prop);
+        g_free(prop);
+    }
+
+    return(ret);
+}/*}}}*/
+
+//Snippet from wmctrl
+static int window_state (Display *disp, Window win, char *arg) {/*{{{*/
+    unsigned long action;
+    Atom prop1 = 0;
+    Atom prop2 = 0;
+    char *p1, *p2;
+    const char *argerr = "The -b option expects a list of comma separated parameters: \"(remove|add|toggle),<PROP1>[,<PROP2>]\"\n";
+
+    if (!arg || strlen(arg) == 0) {
+        fputs(argerr, stderr);
+        return EXIT_FAILURE;
+    }
+
+    if ((p1 = strchr(arg, ','))) {
+        gchar *tmp_prop1, *tmp1;
+        
+        *p1 = '\0';
+
+        /* action */
+        if (strcmp(arg, "remove") == 0) {
+            action = _NET_WM_STATE_REMOVE;
+        }
+        else if (strcmp(arg, "add") == 0) {
+            action = _NET_WM_STATE_ADD;
+        }
+        else if (strcmp(arg, "toggle") == 0) {
+            action = _NET_WM_STATE_TOGGLE;
+        }
+        else {
+            fputs("Invalid action. Use either remove, add or toggle.\n", stderr);
+            return EXIT_FAILURE;
+        }
+        p1++;
+
+        /* the second property */
+        if ((p2 = strchr(p1, ','))) {
+            gchar *tmp_prop2, *tmp2;
+            *p2 = '\0';
+            p2++;
+            if (strlen(p2) == 0) {
+                fputs("Invalid zero length property.\n", stderr);
+                return EXIT_FAILURE;
+            }
+            tmp_prop2 = g_strdup_printf("_NET_WM_STATE_%s", tmp2 = g_ascii_strup(p2, -1));
+            p_verbose("State 2: %s\n", tmp_prop2); 
+            prop2 = XInternAtom(disp, tmp_prop2, False);
+            g_free(tmp2);
+            g_free(tmp_prop2);
+        }
+
+        /* the first property */
+        if (strlen(p1) == 0) {
+            fputs("Invalid zero length property.\n", stderr);
+            return EXIT_FAILURE;
+        }
+        tmp_prop1 = g_strdup_printf("_NET_WM_STATE_%s", tmp1 = g_ascii_strup(p1, -1));
+        p_verbose("State 1: %s\n", tmp_prop1); 
+        prop1 = XInternAtom(disp, tmp_prop1, False);
+        g_free(tmp1);
+        g_free(tmp_prop1);
+
+        
+        return client_msg(disp, win, "_NET_WM_STATE", 
+            action, (unsigned long)prop1, (unsigned long)prop2, 0, 0);
+    }
+    else {
+        fputs(argerr, stderr);
+        return EXIT_FAILURE;
+    }
+}/*}}}*/
+
+// Snippet from wmctrl
+static int client_msg(Display *disp, Window win, char *msg, /* {{{ */
+    unsigned long data0, unsigned long data1, 
+    unsigned long data2, unsigned long data3,
+    unsigned long data4) {
+  XEvent event;
+  long mask = SubstructureRedirectMask | SubstructureNotifyMask;
+
+  event.xclient.type = ClientMessage;
+  event.xclient.serial = 0;
+  event.xclient.send_event = True;
+  event.xclient.message_type = XInternAtom(disp, msg, False);
+  event.xclient.window = win;
+  event.xclient.format = 32;
+  event.xclient.data.l[0] = data0;
+  event.xclient.data.l[1] = data1;
+  event.xclient.data.l[2] = data2;
+  event.xclient.data.l[3] = data3;
+  event.xclient.data.l[4] = data4;
+
+  if (XSendEvent(disp, DefaultRootWindow(disp), False, mask, &event)) {
+    return EXIT_SUCCESS;
+  }
+  else {
+    fprintf(stderr, "Cannot send %s event.\n", msg);
+    return EXIT_FAILURE;
+  }
+}/*}}}*/
 
